@@ -31,10 +31,10 @@ Demonstrates how to build an efficient Glue job that only processes new or chang
 - `pyspark_in_glue.py`: Reusable transformation logic
 
 **Usage**:
-1. Upload CSVs to S3 by partition (date)
-2. Deploy Glue job and set up crawler to register partitions
-3. Run transformation
-4. Store final output in S3 or Redshift
+1. Upload CSVs to S3 
+2. Deploy Glue job and set up crawler to create metadata tables in data catalog
+3. Write glue job using script to use metadata table from  data catalog and converting into pyspark dataframe.
+4. Store final output Redshift
 
 ---
 
