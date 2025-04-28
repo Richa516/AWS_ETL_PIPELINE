@@ -1,0 +1,202 @@
+This code is an AWS Glue ETL (Extract, Transform, Load) script written in Python that processes a dataset of IMDb movies' ratings, performs data
+ quality evaluation, filters the data, changes the schema, and finally writes the results to Amazon S3 and Amazon Redshift. 
+
+1. Imports and Setup
+
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrameCollection
+from awsgluedq.transforms import EvaluateDataQuality
+from awsglue import DynamicFrame
+import concurrent.futures
+import re
+
+This section imports the necessary modules from AWS Glue and PySpark.
+
+AWS Glue provides the DynamicFrame (a data structure used for ETL) and transforms (ApplyMapping, Filter, etc.).
+
+EvaluateDataQuality is used to perform data quality checks on the dataset.
+
+concurrent.futures is used to process multiple filtering tasks in parallel, making the transformation faster.
+
+re is the module used for regular expressions to match specific patterns in data.
+
+2. GroupFilter Class
+
+class GroupFilter:
+    def __init__(self, name, filters):
+        self.name = name
+        self.filters = filters
+The GroupFilter class is defined to help group filters by name and the filtering logic itself. It is useful for the threadedRoute function to apply filters to the dataset in parallel.
+
+3. apply_group_filter Function
+
+def apply_group_filter(source_DyF, group):
+    return Filter.apply(frame=source_DyF, f=group.filters)
+The apply_group_filter function applies a given filter (from a GroupFilter object) to the dataset (source_DyF), returning the filtered data.
+
+4. threadedRoute Function
+
+def threadedRoute(glue_ctx, source_DyF, group_filters) -> DynamicFrameCollection:
+    dynamic_frames = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_filter = {
+            executor.submit(apply_group_filter, source_DyF, gf): gf
+            for gf in group_filters
+        }
+        for future in concurrent.futures.as_completed(future_to_filter):
+            gf = future_to_filter[future]
+            if future.exception() is not None:
+                print("%r generated an exception: %s" % (gf, future.exception()))
+            else:
+                dynamic_frames[gf.name] = future.result()
+    return DynamicFrameCollection(dynamic_frames, glue_ctx)
+This function runs filters in parallel using ThreadPoolExecutor, which improves the performance of the ETL script when there are multiple filters to apply. It collects the filtered results into a DynamicFrameCollection, which is returned.
+
+5. Job Initialization
+
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+This section initializes the Glue job by resolving arguments (like job name), creating a Spark context, and setting up the Glue context for the ETL process.
+
+6. Loading Data from Amazon S3 into a DynamicFrame
+
+S3bucket_node1 = glueContext.create_dynamic_frame.from_catalog(
+    database="movies-dataset-metadata",
+    table_name="imdb_movies_rating_csv",
+    transformation_ctx="S3bucket_node1",
+)
+This code loads the dataset from an AWS Glue Catalog table (imdb_movies_rating_csv) into a DynamicFrame. This table contains metadata about IMDb movies and their ratings.
+
+7. Evaluate Data Quality
+
+EvaluateDataQuality_node1693060710028 = EvaluateDataQuality().process_rows(
+    frame=S3bucket_node1,
+    ruleset=EvaluateDataQuality_node1693060710028_ruleset,
+    publishing_options={...},
+    additional_options={"performanceTuning.caching": "CACHE_NOTHING"},
+)
+The EvaluateDataQuality transformation evaluates the loaded dataset using the defined ruleset. The ruleset checks the completeness, uniqueness, column lengths, and value ranges of various columns in the dataset (e.g., "poster_link", "imdb_rating", etc.).
+
+Data quality evaluation results are published to CloudWatch and can also be stored for further analysis.
+
+8. Selecting Data Quality Evaluation Results
+
+rowLevelOutcomes_node1693061890331 = SelectFromCollection.apply(
+    dfc=EvaluateDataQuality_node1693060710028,
+    key="rowLevelOutcomes",
+    transformation_ctx="rowLevelOutcomes_node1693061890331",
+)
+
+ruleOutcomes_node1693062294645 = SelectFromCollection.apply(
+    dfc=EvaluateDataQuality_node1693060710028,
+    key="ruleOutcomes",
+    transformation_ctx="ruleOutcomes_node1693062294645",
+)
+The script then extracts two different collections of outcomes from the data quality evaluation:
+
+rowLevelOutcomes: Results related to individual rows in the dataset.
+
+ruleOutcomes: Results related to the rules applied during data quality evaluation.
+
+9. Conditional Routing
+
+ConditionalRouter_node1693062474722 = threadedRoute(
+    glueContext,
+    source_DyF=rowLevelOutcomes_node1693061890331,
+    group_filters=[...],
+)
+The threadedRoute function is called to apply two filters:
+
+output_group_1: Filters out rows where the data quality evaluation result is "Failed".
+
+default_group: Contains the rows where the data quality evaluation result is not "Failed".
+
+The results are returned as a DynamicFrameCollection.
+
+10. Selecting Groups for Further Processing
+
+default_group_node1693062474769 = SelectFromCollection.apply(
+    dfc=ConditionalRouter_node1693062474722,
+    key="default_group",
+    transformation_ctx="default_group_node1693062474769",
+)
+
+output_group_1_node1693062474770 = SelectFromCollection.apply(
+    dfc=ConditionalRouter_node1693062474722,
+    key="output_group_1",
+    transformation_ctx="output_group_1_node1693062474770",
+)
+These steps extract the data from the "default_group" and "output_group_1" within the DynamicFrameCollection created by threadedRoute. These represent the rows that passed or failed data quality checks.
+
+11. Change Schema (Apply Mapping)
+
+ChangeSchema_node1693066971682 = ApplyMapping.apply(
+    frame=default_group_node1693062474769,
+    mappings=[...],
+    transformation_ctx="ChangeSchema_node1693066971682",
+)
+This part changes the schema of the data in default_group_node1693062474769 by applying mappings. The mappings define how the columns in the original dataset should be transformed (e.g., changing data types).
+
+12. Writing Data to Amazon S3
+
+AmazonS3_node1693062328577 = glueContext.write_dynamic_frame.from_options(
+    frame=ruleOutcomes_node1693062294645,
+    connection_type="s3",
+    format="json",
+    connection_options={...},
+    transformation_ctx="AmazonS3_node1693062328577",
+)
+
+AmazonS3_node1693062660255 = glueContext.write_dynamic_frame.from_options(
+    frame=output_group_1_node1693062474770,
+    connection_type="s3",
+    format="json",
+    connection_options={...},
+    transformation_ctx="AmazonS3_node1693062660255",
+)
+These steps write the data to Amazon S3 in JSON format:
+
+ruleOutcomes_node1693062294645 is written to one S3 bucket (movies-dq-results/rule_outcome/).
+
+output_group_1_node1693062474770 is written to another S3 bucket (movies-dq-results/bad_data/).
+
+13. Writing Data to Amazon Redshift
+
+AmazonRedshift_node1693062707268 = glueContext.write_dynamic_frame.from_options(
+    frame=ChangeSchema_node1693066971682,
+    connection_type="redshift",
+    connection_options={...},
+    transformation_ctx="AmazonRedshift_node1693062707268",
+)
+This step writes the processed data to an Amazon Redshift table (movies.imdb_movies_rating) after changing its schema.
+
+14. Job Commit
+
+job.commit()
+Finally, the job is committed to mark the successful completion of the ETL process.
+
+Summary:
+This AWS Glue script processes an IMDb movies ratings dataset by:
+
+Loading the data from an S3 bucket.
+
+Evaluating data quality based on various rules.
+
+Filtering and grouping the data into two categories: passed and failed data quality checks.
+
+Changing the schema of the data (e.g., column data types).
+
+Writing the processed data to Amazon S3 (for rule outcomes and bad data).
+
+Writing the final processed data to Amazon Redshift for analysis.
+
+The script uses multi-threading for performance optimization when applying filters, and it's designed to handle data quality checks efficiently.
